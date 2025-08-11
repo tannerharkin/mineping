@@ -131,6 +131,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
@@ -151,44 +153,11 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -la ./artifacts/
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create Release with GitHub CLI
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: MinePing v${{ steps.get_version.outputs.VERSION }}
-          body: |
-            # MinePing v${{ steps.get_version.outputs.VERSION }}
-            
-            REST API for querying Minecraft server status.
-            
-            ## Downloads
-            - **Linux**: `mineping-${{ steps.get_version.outputs.VERSION }}-linux.zip` (static binary, works on all Linux distros)
-            - **macOS Intel**: `mineping-${{ steps.get_version.outputs.VERSION }}-macos.zip`
-            - **macOS Apple Silicon**: `mineping-${{ steps.get_version.outputs.VERSION }}-macos-arm.zip`
-            - **Windows**: `mineping-${{ steps.get_version.outputs.VERSION }}-windows-x64.zip`
-            
-            ## Usage
-            ```bash
-            # Default port 3000
-            ./mineping
-            
-            # Custom port
-            PORT=8080 ./mineping
-            ```
-            
-            See README for API documentation.
-          draft: false
-          prerelease: false
-
-      - name: Upload Release Assets
         run: |
-          for file in ./artifacts/*/*.zip; do
-            filename=$(basename "$file")
-            echo "Uploading $filename"
-            gh release upload "${{ github.ref_name }}" "$file" --clobber
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          gh release create "${{ github.ref_name }}" \
+            --title "MinePing v${{ steps.get_version.outputs.VERSION }}" \
+            --notes # MinePing v${{ steps.get_version.outputs.VERSION }}\n\nREST API for querying Minecraft server status.\n\n## Downloads\n- **Linux**: `mineping-${{ steps.get_version.outputs.VERSION }}-linux.zip` (static binary, works on all Linux distros)\n- **macOS Intel**: `mineping-${{ steps.get_version.outputs.VERSION }}-macos.zip`\n- **macOS Apple Silicon**: `mineping-${{ steps.get_version.outputs.VERSION }}-macos-arm.zip`\n- **Windows**: `mineping-${{ steps.get_version.outputs.VERSION }}-windows-x64.zip`\n\n## Usage\n```bash\n# Default port 3000\n./mineping\n\n# Custom port\nPORT=8080 ./mineping\n```\n\nSee README for API documentation.' \
+            ./artifacts/*/*.zip
