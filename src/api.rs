@@ -23,6 +23,7 @@ static CACHE: OnceCell<Arc<RwLock<HashMap<String, CachedResponse>>>> = OnceCell:
 static TICKETS: OnceCell<Arc<RwLock<HashMap<String, TicketData>>>> = OnceCell::const_new();
 static WORK_QUEUE: OnceCell<Arc<WorkQueue>> = OnceCell::const_new();
 static WORK_SENDER: OnceCell<mpsc::UnboundedSender<WorkItem>> = OnceCell::const_new();
+static WORKER_STATES: OnceCell<Arc<RwLock<Vec<WorkerState>>>> = OnceCell::const_new();
 
 #[derive(Clone)]
 struct CachedResponse {
@@ -58,6 +59,13 @@ struct WorkItem {
     host: String,
     port: u16,
     queued_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkerState {
+    Idle,
+    Processing { host: String },
+    Connecting,
 }
 
 struct WorkQueue {
@@ -177,34 +185,34 @@ impl Stats {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct StatsResponse {
-    uptime_seconds: u64,
-    total_requests: u64,
-    successful_requests: u64,
-    failed_requests: u64,
-    success_rate: f64,
-    requests_per_minute: f64,
-    protocol_stats: ProtocolStats,
-    queue_stats: QueueStats,
-    worker_count: usize,
+    pub uptime_seconds: u64,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub success_rate: f64,
+    pub requests_per_minute: f64,
+    pub protocol_stats: ProtocolStats,
+    pub queue_stats: QueueStats,
+    pub worker_count: usize,
 }
 
-#[derive(Serialize)]
-struct ProtocolStats {
-    modern_slp_percentage: f64,
-    legacy_slp_percentage: f64,
-    query_enabled_percentage: f64,
+#[derive(Serialize, Clone)]
+pub struct ProtocolStats {
+    pub modern_slp_percentage: f64,
+    pub legacy_slp_percentage: f64,
+    pub query_enabled_percentage: f64,
 }
 
-#[derive(Serialize)]
-struct QueueStats {
-    pending_tickets: usize,
-    processing_tickets: usize,
-    total_queued: u64,
-    total_completed: u64,
-    avg_queue_time_ms: u64,
-    avg_process_time_ms: u64,
+#[derive(Serialize, Clone)]
+pub struct QueueStats {
+    pub pending_tickets: usize,
+    pub processing_tickets: usize,
+    pub total_queued: u64,
+    pub total_completed: u64,
+    pub avg_queue_time_ms: u64,
+    pub avg_process_time_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -301,6 +309,14 @@ async fn process_work(worker_id: usize, work: WorkItem) {
     debug!("Worker {} processing {}:{} (queued for {}ms)", 
            worker_id, work.host, work.port, queue_time);
     
+    // Update worker state
+    {
+        let mut states = get_worker_states().await.write().await;
+        if worker_id < states.len() {
+            states[worker_id] = WorkerState::Processing { host: work.host.clone() };
+        }
+    }
+    
     let queue = get_work_queue().await;
     queue.remove_ticket(&work.ticket_id).await;
     queue.start_processing();
@@ -311,6 +327,14 @@ async fn process_work(worker_id: usize, work: WorkItem) {
         if let Some(ticket_data) = tickets.get_mut(&work.ticket_id) {
             ticket_data.status = TicketStatus::Processing;
             ticket_data.started_at = Some(Instant::now());
+        }
+    }
+    
+    // Update worker state to connecting
+    {
+        let mut states = get_worker_states().await.write().await;
+        if worker_id < states.len() {
+            states[worker_id] = WorkerState::Connecting;
         }
     }
     
@@ -362,6 +386,14 @@ async fn process_work(worker_id: usize, work: WorkItem) {
                 
                 ticket_data.status = TicketStatus::Error { message: error_msg };
             }
+        }
+    }
+    
+    // Reset worker state to idle
+    {
+        let mut states = get_worker_states().await.write().await;
+        if worker_id < states.len() {
+            states[worker_id] = WorkerState::Idle;
         }
     }
 }
@@ -431,6 +463,70 @@ async fn get_tickets() -> &'static Arc<RwLock<HashMap<String, TicketData>>> {
 
 async fn get_work_queue() -> &'static Arc<WorkQueue> {
     WORK_QUEUE.get_or_init(|| async { Arc::new(WorkQueue::new()) }).await
+}
+
+async fn get_worker_states() -> &'static Arc<RwLock<Vec<WorkerState>>> {
+    WORKER_STATES.get_or_init(|| async {
+        Arc::new(RwLock::new(vec![WorkerState::Idle; WORKER_COUNT]))
+    }).await
+}
+
+// Public functions for TUI
+pub async fn get_worker_states_snapshot() -> Vec<WorkerState> {
+    get_worker_states().await.read().await.clone()
+}
+
+pub async fn get_stats_data() -> StatsResponse {
+    let stats = get_stats().await;
+    let total = stats.total_requests.load(Ordering::Relaxed);
+    let successful = stats.successful_requests.load(Ordering::Relaxed);
+    let failed = stats.failed_requests.load(Ordering::Relaxed);
+    
+    let uptime = stats.start_time.elapsed().unwrap_or_default().as_secs();
+    let success_rate = if total > 0 {
+        (successful as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    let rpm = if uptime > 0 {
+        (total as f64 / uptime as f64) * 60.0
+    } else {
+        0.0
+    };
+    
+    let counts = stats.protocol_counts.read().await;
+    let protocol_stats = ProtocolStats {
+        modern_slp_percentage: if successful > 0 {
+            (counts.modern_slp as f64 / successful as f64) * 100.0
+        } else {
+            0.0
+        },
+        legacy_slp_percentage: if successful > 0 {
+            (counts.legacy_slp as f64 / successful as f64) * 100.0
+        } else {
+            0.0
+        },
+        query_enabled_percentage: if successful > 0 {
+            (counts.query_enabled as f64 / successful as f64) * 100.0
+        } else {
+            0.0
+        },
+    };
+    
+    let queue_stats = get_work_queue().await.get_stats().await;
+    
+    StatsResponse {
+        uptime_seconds: uptime,
+        total_requests: total,
+        successful_requests: successful,
+        failed_requests: failed,
+        success_rate,
+        requests_per_minute: rpm,
+        protocol_stats,
+        queue_stats,
+        worker_count: WORKER_COUNT,
+    }
 }
 
 // API Handlers
@@ -620,54 +716,5 @@ pub async fn health() -> Json<serde_json::Value> {
 }
 
 pub async fn stats() -> Json<StatsResponse> {
-    let stats = get_stats().await;
-    let total = stats.total_requests.load(Ordering::Relaxed);
-    let successful = stats.successful_requests.load(Ordering::Relaxed);
-    let failed = stats.failed_requests.load(Ordering::Relaxed);
-    
-    let uptime = stats.start_time.elapsed().unwrap_or_default().as_secs();
-    let success_rate = if total > 0 {
-        (successful as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-    
-    let rpm = if uptime > 0 {
-        (total as f64 / uptime as f64) * 60.0
-    } else {
-        0.0
-    };
-    
-    let counts = stats.protocol_counts.read().await;
-    let protocol_stats = ProtocolStats {
-        modern_slp_percentage: if successful > 0 {
-            (counts.modern_slp as f64 / successful as f64) * 100.0
-        } else {
-            0.0
-        },
-        legacy_slp_percentage: if successful > 0 {
-            (counts.legacy_slp as f64 / successful as f64) * 100.0
-        } else {
-            0.0
-        },
-        query_enabled_percentage: if successful > 0 {
-            (counts.query_enabled as f64 / successful as f64) * 100.0
-        } else {
-            0.0
-        },
-    };
-    
-    let queue_stats = get_work_queue().await.get_stats().await;
-    
-    Json(StatsResponse {
-        uptime_seconds: uptime,
-        total_requests: total,
-        successful_requests: successful,
-        failed_requests: failed,
-        success_rate,
-        requests_per_minute: rpm,
-        protocol_stats,
-        queue_stats,
-        worker_count: WORKER_COUNT,
-    })
+    get_stats_data().await.into()
 }
