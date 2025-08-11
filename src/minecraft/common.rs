@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PORT: u16 = 25565;
-pub const TIMEOUT_MS: u64 = 5000;
+pub const TIMEOUT_MS: u64 = 3000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
